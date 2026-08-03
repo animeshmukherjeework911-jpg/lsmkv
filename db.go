@@ -97,5 +97,9 @@ func (db *DB) Delete(key []byte) error {
 // Close flushes the active memtable and closes all files cleanly. After a clean
 // Close, the next Open should have nothing to replay.
 func (db *DB) Close() error {
-	return ErrNotImplemented // TODO(M3)
+	if err := db.wal.Close(); err != nil {
+		return err
+	}
+
+	return nil
 }

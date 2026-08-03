@@ -1,5 +1,7 @@
 package lsmkv
 
+import "os"
+
 // SSTable is an immutable, sorted, on-disk table produced by flushing a memtable.
 // Immutability is the trick that makes the rest of the engine simple: a file is
 // never edited once written — only created, and later deleted by compaction (M5).
@@ -14,6 +16,9 @@ package lsmkv
 //     A read-heavy store lives or dies on this early-out.
 type SSTable struct {
 	// TODO(M3): path, file handle, in-memory sparse index, and (M4) bloom filter.
+	path string
+	file *os.File
+	index map[string]int64
 }
 
 // FlushMemtable writes m's sorted records to a brand-new SSTable file at path.

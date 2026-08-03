@@ -1,5 +1,10 @@
 package lsmkv
 
+import (
+	"bytes"
+	"sort"
+)
+
 // Memtable is the in-memory write buffer. Reads consult it first; it must stay
 // sorted by key so it can be streamed into a sorted SSTable in a single pass (M3).
 //
@@ -44,5 +49,12 @@ func (m *Memtable) SizeBytes() int {
 
 // Sorted returns every record in ascending key order, ready to write to an SSTable.
 func (m *Memtable) Sorted() []Record {
-	panic("TODO(M3)")
+	records := make([]Record, 0, len(m.records))
+	for _, val := range m.records {
+		records = append(records, val)
+	}
+	sort.Slice(records, func(i, j int) bool {
+		return bytes.Compare(records[i].Key, records[j].Key) < 0
+	})
+	return records
 }
