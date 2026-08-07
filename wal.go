@@ -77,7 +77,10 @@ func (w *WAL) Replay(apply func(Record) error) error {
 // Truncate resets the log after a memtable flush (M3): once the data is safely in
 // an SSTable, the log entries that produced it are redundant and can be dropped.
 func (w *WAL) Truncate() error {
-	return ErrNotImplemented // TODO(M3)
+	if err := w.file.Truncate(0); err != nil {
+		return err
+	}
+	return w.file.Sync()
 }
 
 // Close flushes and closes the underlying file.

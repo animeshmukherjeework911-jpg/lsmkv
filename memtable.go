@@ -24,6 +24,7 @@ func NewMemtable() *Memtable {
 // Put inserts or overwrites a record. A delete is Put with a RecordDelete kind,
 // never a map removal — the tombstone has to be visible to shadow older SSTables.
 func (m *Memtable) Put(r Record) {
+
 	key := string(r.Key)
 	if res, ok := m.records[key]; ok {
 		m.size -= res.GetRecordLen()
