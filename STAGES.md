@@ -28,8 +28,8 @@ ignored on replay.
 torn-write detection via CRC." This is your correctness home turf and the single
 most credible thing in the whole project.
 - [x] `TestCrashRecovery_WALReplay` green
-- [ ] `TestCrashRecovery_TornWrite` green (still skipped)
-- [ ] Can explain, out loud, why fsync-before-ack is the whole durability promise.
+- [x] `TestCrashRecovery_TornWrite` green
+- [x] Can explain, out loud, why fsync-before-ack is the whole durability promise.
 
 **Implementation checklist:**
 - [x] `WAL.file` populated in `OpenWAL` (`wal.go`)
@@ -41,7 +41,7 @@ most credible thing in the whole project.
 - [x] `DB.Put` — `wal.Append` then `mem.Put`, per the write-path doc comment (`db.go`)
 - [x] `DB.Get` — reads from `mem`, tombstone-aware (`db.go`)
 - [x] `DB.Delete` — tombstone via `wal.Append` + `mem.Put`, done ahead of schedule (belongs to Stage 2 but already correct) (`db.go`)
-- [ ] Un-skip `TestCrashRecovery_TornWrite`, hand-truncate a WAL file mid-record in the test, assert `Open` still succeeds and only the intact records survive — **last item blocking Stage 1**
+- [x] Un-skip `TestCrashRecovery_TornWrite`, hand-truncate a WAL file mid-record in the test, assert `Open` still succeeds and only the intact records survive
 
 ---
 
@@ -52,17 +52,17 @@ most credible thing in the whole project.
 put, get, and delete keys, and a deleted key stays dead. It's not yet on disk, but
 it works and it's crash-durable via Stage 1.
 **Portfolio value:** medium. The store now *does something*.
-- [ ] `TestPutGet` green
-- [ ] `TestDeleteTombstone` green
-- [ ] A 10-line demo (or test) that puts, gets, deletes, and prints results.
+- [x] `TestPutGet` green
+- [x] `TestDeleteTombstone` green
+- [x] A 10-line demo (or test) that puts, gets, deletes, and prints results.
 
 **Implementation checklist:**
-- [ ] `Memtable` backing storage — a `map[string]Record` is fine to start (`memtable.go`)
-- [ ] `Memtable.Put` — insert/overwrite, tombstone is just `RecordKind = RecordDelete`, never a map delete (`memtable.go`)
-- [ ] `Memtable.Get` — a tombstone counts as found; caller must not fall through (`memtable.go`)
-- [ ] `Memtable.SizeBytes` — running byte count, drives the M3 flush threshold (`memtable.go`)
-- [ ] `DB.Delete` — writes a `RecordDelete` through the same `wal.Append` → `mem.Put` path as `Put` (`db.go`)
-- [ ] `DB.Get` — return `(nil, false, nil)` on a tombstone hit, not the tombstone's value
+- [x] `Memtable` backing storage — a `map[string]Record` is fine to start (`memtable.go`)
+- [x] `Memtable.Put` — insert/overwrite, tombstone is just `RecordKind = RecordDelete`, never a map delete (`memtable.go`)
+- [x] `Memtable.Get` — a tombstone counts as found; caller must not fall through (`memtable.go`)
+- [x] `Memtable.SizeBytes` — running byte count, drives the M3 flush threshold (`memtable.go`)
+- [x] `DB.Delete` — writes a `RecordDelete` through the same `wal.Append` → `mem.Put` path as `Put` (`db.go`)
+- [x] `DB.Get` — return `(nil, false, nil)` on a tombstone hit, not the tombstone's value
 
 ---
 
@@ -74,21 +74,21 @@ lives in SSTable files on disk and comes back after a clean restart. This is the
 "it's actually a database now" moment.
 **Portfolio value:** HIGH. This is the honest floor you can stop at and still say
 "I built a persistent LSM key-value store from scratch" and mean it.
-- [ ] `TestPersistenceAcrossReopen` green
-- [ ] Write keys, restart the process, read them back — on disk, no WAL replay needed.
-- [ ] You can describe your SSTable file format on a whiteboard.
+- [x] `TestPersistenceAcrossReopen` green
+- [x] Write keys, restart the process, read them back — on disk, no WAL replay needed.
+- [x] You can describe your SSTable file format on a whiteboard.
 
 **Implementation checklist:**
-- [ ] `Memtable.Sorted` — ascending key order, ready to stream to disk (`memtable.go`)
-- [ ] `SSTable` fields — path, file handle, in-memory sparse index (`sstable.go`)
-- [ ] `FlushMemtable` — write sorted records + sparse index + footer to a new file (`sstable.go`)
-- [ ] `SSTable.Get` — binary-search the sparse index to a block, scan within it (`sstable.go`)
-- [ ] `SSTable.Path` (`sstable.go`)
-- [ ] `WAL.Truncate` — called right after a successful flush (`wal.go`)
-- [ ] `DB` grows a flush trigger in `Put` (memtable over `SizeBytes` threshold) that calls `FlushMemtable` then `wal.Truncate`, and appends the new `SSTable` to `db.ssts`
-- [ ] `DB.Get` — check `mem` first, then `ssts` newest → oldest
-- [ ] `DB.Open` — load existing SSTable files from `dir` before replaying the WAL
-- [ ] `DB.Close` — flush the active memtable, close all SSTable file handles and the WAL
+- [x] `Memtable.Sorted` — ascending key order, ready to stream to disk (`memtable.go`)
+- [x] `SSTable` fields — path, file handle, in-memory sparse index (`sstable.go`)
+- [x] `FlushMemtable` — write sorted records + sparse index + footer to a new file (`sstable.go`)
+- [x] `SSTable.Get` — binary-search the sparse index to a block, scan within it (`sstable.go`)
+- [x] `SSTable.Path` (`sstable.go`)
+- [x] `WAL.Truncate` — called right after a successful flush (`wal.go`)
+- [x] `DB` grows a flush trigger in `Put` (memtable over `SizeBytes` threshold) that calls `FlushMemtable` then `wal.Truncate`, and appends the new `SSTable` to `db.ssts`
+- [x] `DB.Get` — check `mem` first, then `ssts` newest → oldest
+- [x] `DB.Open` — load existing SSTable files from `dir` before replaying the WAL
+- [x] `DB.Close` — flush the active memtable, close all SSTable file handles and the WAL
 
 ---
 

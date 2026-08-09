@@ -1,6 +1,10 @@
 package lsmkv
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 // The recovery tests are the soul of the project. Anyone can build a hash map on
 // disk; the engineering is in what happens when the process dies mid-write.
@@ -38,11 +42,58 @@ func TestCrashRecovery_WALReplay(t *testing.T) {
 }
 
 // GATE M1 (harder) — a torn final record is ignored, and everything before it
-// still recovers. Un-skip this once Encode/Decode carry a crc.
+// still recovers.
 func TestCrashRecovery_TornWrite(t *testing.T) {
-	t.Skip("un-skip in M1 once record encoding carries a crc — see README")
-	// TODO(M1): Put N records, then hand-truncate the WAL file a few bytes into
-	// the last record to fake a torn append. Reopen and assert:
-	//   (1) Open returns nil error, and
-	//   (2) the first N-1 keys are present, the torn Nth is simply absent.
+	dir := t.TempDir()
+	walPath := filepath.Join(dir, "wal.log")
+
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	keys := []string{"k0", "k1", "k2", "k3"}
+	for _, k := range keys {
+		if err := db.Put([]byte(k), []byte("value-"+k)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// size of the WAL right after the last INTACT record
+	info, err := os.Stat(walPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	goodSize := info.Size()
+
+	// one more record, which we're about to tear mid-append
+	if err := db.Put([]byte("torn"), []byte("should-not-survive")); err != nil {
+		t.Fatal(err)
+	}
+
+	// simulate `kill -9` mid-write: truncate a few bytes into the torn record,
+	// not at a record boundary.
+	if err := os.Truncate(walPath, goodSize+5); err != nil {
+		t.Fatal(err)
+	}
+
+	// abandon the handle without Close, exactly like TestCrashRecovery_WALReplay
+	db = nil
+
+	db2, err := Open(dir)
+	if err != nil {
+		t.Fatalf("recovery failed to open the db: %v", err)
+	}
+	defer db2.Close()
+
+	for _, k := range keys {
+		v, ok, _ := db2.Get([]byte(k))
+		if !ok || string(v) != "value-"+k {
+			t.Fatalf("lost intact record %q after torn-write recovery (got %q/%v)", k, v, ok)
+		}
+	}
+
+	if _, ok, _ := db2.Get([]byte("torn")); ok {
+		t.Fatalf("torn record should not have survived recovery, but it did")
+	}
 }
