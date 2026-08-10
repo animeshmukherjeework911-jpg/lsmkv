@@ -5,6 +5,16 @@ import (
 	"os"
 )
 
+const (
+	sparseIndexInterval    = 16
+	bloomFalsePositiveRate = 0.01
+	// minEncodedRecordLen is the smallest a record.go-encoded record can be:
+	// the 13-byte header (crc+keyLen+valLen+kind) plus a non-empty 1-byte key.
+	// Used to upper-bound a record count from raw file size without a second
+	// decode pass — bloom filters tolerate over-sizing safely.
+	minEncodedRecordLen = 14
+)
+
 // SSTable is an immutable, sorted, on-disk table produced by flushing a memtable.
 // Immutability is the trick that makes the rest of the engine simple: a file is
 // never edited once written — only created, and later deleted by compaction (M5).
@@ -17,24 +27,54 @@ import (
 //	    of scanning the whole file.
 //	  - bloom filter (M4): lets Get skip this file entirely when the key is absent.
 //	    A read-heavy store lives or dies on this early-out.
+
+type indexMode int
+
+const (
+	fullIndexMode indexMode = iota
+	sparseIndexMode
+)
+
+type sstableIndex interface {
+	add(key []byte, offset int64)
+	lookup(key []byte) (offset int64, found bool)
+}
+
 type SSTable struct {
 	// TODO(M3): path, file handle, in-memory sparse index, and (M4) bloom filter.
 	path  string
 	file  *os.File
-	index map[string]int64
+	index sstableIndex
+}
+
+func newIndexFor(mode indexMode) sstableIndex {
+	switch mode {
+	case sparseIndexMode:
+		return newSparseIndex(sparseIndexInterval)
+	default:
+		return newFullIndex()
+	}
 }
 
 // FlushMemtable writes m's sorted records to a brand-new SSTable file at path.
-func FlushMemtable(m *Memtable, path string) (*SSTable, error) {
+func FlushMemtable(m *Memtable, path string, mode indexMode) (*SSTable, error) {
 
+	index := newIndexFor(mode)
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0644)
 
 	if err != nil {
 		return nil, err
 	}
 
-	index := make(map[string]int64)
 	offset := int64(0)
+	if mode == sparseIndexMode {
+		bloom := NewBloomFilter(len(m.records), bloomFalsePositiveRate)
+		x, ok := index.(*sparseIndex)
+		if ok {
+			x.attachBloom(bloom)
+			x.attachReader(file)
+		}
+	}
 
 	for _, record := range m.Sorted() {
 		encodedRecord, err := Encode(record)
@@ -42,11 +82,18 @@ func FlushMemtable(m *Memtable, path string) (*SSTable, error) {
 			return nil, err
 		}
 
-		index[string(record.Key)] = offset
+		index.add(record.Key, offset)
 		offset += int64(len(encodedRecord))
 
 		if _, err := file.Write(encodedRecord); err != nil {
 			return nil, err
+		}
+	}
+
+	if mode == sparseIndexMode {
+		x, ok := index.(*sparseIndex)
+		if ok {
+			x.attachSize(offset)
 		}
 	}
 
@@ -58,7 +105,8 @@ func FlushMemtable(m *Memtable, path string) (*SSTable, error) {
 }
 
 // OpenSSTable reopens an existing table, loading its index (and bloom) into memory.
-func OpenSSTable(path string) (*SSTable, error) {
+func OpenSSTable(path string, mode indexMode) (*SSTable, error) {
+	index := newIndexFor(mode)
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -68,15 +116,32 @@ func OpenSSTable(path string) (*SSTable, error) {
 	if err != nil {
 		return nil, err
 	}
-	index := make(map[string]int64)
+
+	if mode == sparseIndexMode {
+		expectedKeys := len(data) / minEncodedRecordLen
+		bloom := NewBloomFilter(expectedKeys, bloomFalsePositiveRate)
+		x, ok := index.(*sparseIndex)
+		if ok {
+			x.attachBloom(bloom)
+			x.attachReader(file)
+		}
+	}
+
 	offset := int64(0)
 	for offset < int64(len(data)) {
 		rec, n, err := Decode(data[offset:])
 		if err != nil {
 			return nil, err
 		}
-		index[string(rec.Key)] = offset
+		index.add(rec.Key, offset)
 		offset += int64(n)
+	}
+
+	if mode == sparseIndexMode {
+		x, ok := index.(*sparseIndex)
+		if ok {
+			x.attachSize(offset)
+		}
 	}
 
 	return &SSTable{path: path, file: file, index: index}, nil
@@ -92,7 +157,7 @@ func (s *SSTable) Get(key []byte) (Record, bool, error) {
 		return Record{}, false, err
 	}
 
-	offset, ok := s.index[string(key)]
+	offset, ok := s.index.lookup(key)
 	if !ok {
 		return Record{}, false, nil
 	}
