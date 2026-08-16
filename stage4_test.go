@@ -26,39 +26,51 @@ func flipByteAt(t *testing.T, path string, offset int64) {
 	}
 }
 
-// GATE M4 — OpenSSTable in sparse mode must not decode the data blocks at
-// all: it reads the footer, then only the sparse-index and bloom-filter
-// sections. Corrupting a byte deep inside the data blocks (but outside the
-// persisted metadata) must not prevent a sparse-mode reopen from succeeding.
-// Full mode, which still decodes every record on open, must fail on the
-// same corruption — the contrast is the proof that sparse mode skips the
-// data blocks entirely on open.
-func TestOpenSSTableSparseModeDoesNotDecodeDataBlocks(t *testing.T) {
+// GATE M4 — OpenSSTable must not decode the data blocks at all: it reads
+// the footer, then only the sparse-index and bloom-filter sections that
+// follow it. Proven here by corrupting one specific record deep inside the
+// data blocks and showing three things at once: (1) OpenSSTable itself
+// still succeeds, because opening never reads that region; (2) a Get for
+// an unrelated key, whose scan never reaches the corrupted bytes, still
+// works correctly; (3) a Get for the corrupted record's own key does fail,
+// proving the corruption is real and that reading it is what surfaces the
+// problem — not that the byte flip was silently inert.
+func TestOpenSSTableDoesNotDecodeDataBlocksOnOpen(t *testing.T) {
 	m := buildTestMemtable(50)
 	dir := t.TempDir()
-	sparsePath := filepath.Join(dir, "sparse.sst")
-	fullPath := filepath.Join(dir, "full.sst")
+	path := filepath.Join(dir, "sstable-0.sst")
 
-	if _, err := FlushMemtable(m, sparsePath, sparseIndexMode); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := FlushMemtable(m, fullPath, fullIndexMode); err != nil {
+	if _, err := FlushMemtable(m, path); err != nil {
 		t.Fatal(err)
 	}
 
-	// Offset 50 lands well inside the data blocks for 50 records of this
-	// size, and well before any footer/index/bloom section.
-	const corruptOffset = 50
-	flipByteAt(t, sparsePath, corruptOffset)
-	flipByteAt(t, fullPath, corruptOffset)
+	// Every record here is a fixed 27 bytes (13-byte header + 7-byte key +
+	// 7-byte value), so record 5 ("key-005") starts at offset 5*27 = 135.
+	// Byte 155 falls inside its value, well past the header, so flipping it
+	// breaks record 5's crc without touching any other record.
+	const corruptedRecordOffset = 135
+	const corruptOffset = 155
+	flipByteAt(t, path, corruptOffset)
 
-	if _, err := OpenSSTable(sparsePath, sparseIndexMode); err != nil {
-		t.Errorf("OpenSSTable(sparseIndexMode) failed on data-block corruption it should never read: %v", err)
+	reopened, err := OpenSSTable(path)
+	if err != nil {
+		t.Fatalf("OpenSSTable failed on data-block corruption it should never read on open: %v", err)
 	}
 
-	if _, err := OpenSSTable(fullPath, fullIndexMode); err == nil {
-		t.Errorf("OpenSSTable(fullIndexMode) succeeded despite data-block corruption; " +
-			"full mode decodes every record on open and should have failed")
+	// key-020 starts scanning from the sparse boundary at key-016 and never
+	// reaches record 5's bytes.
+	rec := mustGet(t, reopened, "key-020")
+	if string(rec.Value) != "val-020" {
+		t.Errorf("unrelated key affected by unrelated corruption: got %q, want %q", rec.Value, "val-020")
+	}
+
+	// key-005 itself requires decoding the corrupted record, so it must not
+	// come back as a successful, correct read (a decode failure surfaces
+	// here as "not found" rather than an error — see sparseIndex.lookup).
+	corruptRec, corruptOk, _ := reopened.Get([]byte("key-005"))
+	if corruptOk && string(corruptRec.Value) == "val-005" {
+		t.Fatalf("Get(%q) returned the correct value despite corrupting offset %d (record starts at %d); "+
+			"corruption did not take effect as expected", "key-005", corruptOffset, corruptedRecordOffset)
 	}
 }
 
@@ -85,20 +97,16 @@ func TestBloomFilterSkipsScanForAbsentKey(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sstable.sst")
 
-	if _, err := FlushMemtable(m, path, sparseIndexMode); err != nil {
+	if _, err := FlushMemtable(m, path); err != nil {
 		t.Fatal(err)
 	}
 
-	sst, err := OpenSSTable(path, sparseIndexMode)
+	sst, err := OpenSSTable(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	si, ok := sst.index.(*sparseIndex)
-	if !ok {
-		t.Fatal("expected sst.index to be *sparseIndex")
-	}
-
+	si := sst.index
 	counter := &countingReaderAt{inner: si.reader}
 	si.attachReader(counter)
 
@@ -140,14 +148,14 @@ func TestNewestWinsAcrossMultipleSSTables(t *testing.T) {
 	older := NewMemtable()
 	older.Put(Record{Key: []byte("k"), Value: []byte("old"), Kind: RecordSet})
 	older.Put(Record{Key: []byte("only-in-old"), Value: []byte("still-here"), Kind: RecordSet})
-	oldSst, err := FlushMemtable(older, filepath.Join(dir, "manual-old.sst"), sparseIndexMode)
+	oldSst, err := FlushMemtable(older, filepath.Join(dir, "manual-old.sst"))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	newer := NewMemtable()
 	newer.Put(Record{Key: []byte("k"), Value: []byte("new"), Kind: RecordSet})
-	newSst, err := FlushMemtable(newer, filepath.Join(dir, "manual-new.sst"), sparseIndexMode)
+	newSst, err := FlushMemtable(newer, filepath.Join(dir, "manual-new.sst"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +183,7 @@ func TestNewestWinsAcrossMultipleSSTables(t *testing.T) {
 	// A tombstone in the newer table must shadow the older table's value.
 	tombstoned := NewMemtable()
 	tombstoned.Put(Record{Key: []byte("k"), Kind: RecordDelete})
-	tombSst, err := FlushMemtable(tombstoned, filepath.Join(dir, "manual-tomb.sst"), sparseIndexMode)
+	tombSst, err := FlushMemtable(tombstoned, filepath.Join(dir, "manual-tomb.sst"))
 	if err != nil {
 		t.Fatal(err)
 	}

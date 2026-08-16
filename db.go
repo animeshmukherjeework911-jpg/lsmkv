@@ -14,7 +14,6 @@ const (
 	sstableSuffix                 = ".sst"
 	sstableSeqWidth               = 8
 	defaultMemtableFlushThreshold = 4 << 20
-	defaultIndexMode              = sparseIndexMode
 )
 
 // DB is the public storage engine. Keep the two paths below taped to your monitor;
@@ -113,7 +112,7 @@ func loadSSTables(dir string) ([]*SSTable, error) {
 
 	ssts := make([]*SSTable, 0, len(entries))
 	for _, e := range entries {
-		sst, err := OpenSSTable(e.path, defaultIndexMode)
+		sst, err := OpenSSTable(e.path)
 		if err != nil {
 			return nil, err
 		}
@@ -169,7 +168,7 @@ func (db *DB) Put(key, value []byte) error {
 		if err != nil {
 			return err
 		}
-		sst, err := FlushMemtable(db.mem, nextSSTablePathStr, defaultIndexMode)
+		sst, err := FlushMemtable(db.mem, nextSSTablePathStr)
 		if err != nil {
 			return err
 		}
@@ -236,7 +235,7 @@ func (db *DB) Close() error {
 			return err
 		}
 
-		sst, err := FlushMemtable(db.mem, path, defaultIndexMode)
+		sst, err := FlushMemtable(db.mem, path)
 		if err != nil {
 			return err
 		}

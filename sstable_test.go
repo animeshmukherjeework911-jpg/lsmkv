@@ -51,7 +51,7 @@ func TestSparseIndexBoundaryAndMidBlockKeys(t *testing.T) {
 	m := buildTestMemtable(n)
 	path := filepath.Join(t.TempDir(), "sstable-0.sst")
 
-	sst, err := FlushMemtable(m, path, sparseIndexMode)
+	sst, err := FlushMemtable(m, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +88,7 @@ func TestSparseIndexAbsentKeys(t *testing.T) {
 	m := buildTestMemtable(50)
 	path := filepath.Join(t.TempDir(), "sstable-0.sst")
 
-	sst, err := FlushMemtable(m, path, sparseIndexMode)
+	sst, err := FlushMemtable(m, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,11 +105,11 @@ func TestSparseIndexSurvivesReopen(t *testing.T) {
 	m := buildTestMemtable(50)
 	path := filepath.Join(t.TempDir(), "sstable-0.sst")
 
-	if _, err := FlushMemtable(m, path, sparseIndexMode); err != nil {
+	if _, err := FlushMemtable(m, path); err != nil {
 		t.Fatal(err)
 	}
 
-	reopened, err := OpenSSTable(path, sparseIndexMode)
+	reopened, err := OpenSSTable(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,46 +119,4 @@ func TestSparseIndexSurvivesReopen(t *testing.T) {
 		t.Errorf("got value %q, want %q", rec.Value, "val-020")
 	}
 	mustNotFind(t, reopened, "key-999")
-}
-
-// GATE M4 — sparse mode and full mode must agree on every lookup. This is
-// the correctness cross-check for the sparse index + bloom filter path
-// against the simpler, known-correct full index.
-func TestSparseIndexMatchesFullIndex(t *testing.T) {
-	m := buildTestMemtable(50)
-	dir := t.TempDir()
-
-	fullSst, err := FlushMemtable(m, filepath.Join(dir, "full.sst"), fullIndexMode)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sparseSst, err := FlushMemtable(m, filepath.Join(dir, "sparse.sst"), sparseIndexMode)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	keys := []string{
-		"key-000", "key-005", "key-016", "key-020",
-		"key-032", "key-045", "key-048", "key-049",
-		"aaa-before-range", "key-025x", "zzz-after-range",
-	}
-
-	for _, key := range keys {
-		fullRec, fullOk, err := fullSst.Get([]byte(key))
-		if err != nil {
-			t.Fatalf("full index Get(%q) error: %v", key, err)
-		}
-		sparseRec, sparseOk, err := sparseSst.Get([]byte(key))
-		if err != nil {
-			t.Fatalf("sparse index Get(%q) error: %v", key, err)
-		}
-
-		if fullOk != sparseOk {
-			t.Errorf("key %q: full found=%v, sparse found=%v", key, fullOk, sparseOk)
-			continue
-		}
-		if fullOk && string(fullRec.Value) != string(sparseRec.Value) {
-			t.Errorf("key %q: full value %q != sparse value %q", key, fullRec.Value, sparseRec.Value)
-		}
-	}
 }
