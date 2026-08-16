@@ -65,10 +65,10 @@ func FlushMemtable(m *Memtable, path string, mode indexMode) (*SSTable, error) {
 	if err != nil {
 		return nil, err
 	}
-
+	var bloom *BloomFilter
 	offset := int64(0)
 	if mode == sparseIndexMode {
-		bloom := NewBloomFilter(len(m.records), bloomFalsePositiveRate)
+		bloom = NewBloomFilter(len(m.records), bloomFalsePositiveRate)
 		x, ok := index.(*sparseIndex)
 		if ok {
 			x.attachBloom(bloom)
@@ -94,6 +94,30 @@ func FlushMemtable(m *Memtable, path string, mode indexMode) (*SSTable, error) {
 		x, ok := index.(*sparseIndex)
 		if ok {
 			x.attachSize(offset)
+
+			sparseIndexOffset := offset
+			sparseIndexBytes := x.EncodeSparseIndex()
+			if _, err := file.Write(sparseIndexBytes); err != nil {
+				return nil, err
+			}
+			offset += int64(len(sparseIndexBytes))
+
+			bloomFilterOffset := offset
+			bloomBytes := EncodeBloomFilter(bloom)
+			if _, err := file.Write(bloomBytes); err != nil {
+				return nil, err
+			}
+			offset += int64(len(bloomBytes))
+
+			footer := &Footer{
+				sparseIndexOffset: uint64(sparseIndexOffset),
+				sparseIndexLength: uint64(len(sparseIndexBytes)),
+				bloomFilterOffset: uint64(bloomFilterOffset),
+				bloomFilterLength: uint64(len(bloomBytes)),
+			}
+			if _, err := file.Write(footer.EncodeFooter()); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -112,19 +136,55 @@ func OpenSSTable(path string, mode indexMode) (*SSTable, error) {
 		return nil, err
 	}
 
+	if mode == sparseIndexMode {
+		x, ok := index.(*sparseIndex)
+		if !ok {
+			return &SSTable{path: path, file: file, index: index}, nil
+		}
+
+		info, err := file.Stat()
+		if err != nil {
+			return nil, err
+		}
+
+		footerBuf := make([]byte, footerSize)
+		if _, err := file.ReadAt(footerBuf, info.Size()-footerSize); err != nil {
+			return nil, err
+		}
+		footer, err := DecodeFooter(footerBuf)
+		if err != nil {
+			return nil, err
+		}
+
+		sparseIndexBuf := make([]byte, footer.sparseIndexLength)
+		if _, err := file.ReadAt(sparseIndexBuf, int64(footer.sparseIndexOffset)); err != nil {
+			return nil, err
+		}
+		decodedIndex, err := DecodeSparseIndex(sparseIndexBuf)
+		if err != nil {
+			return nil, err
+		}
+
+		bloomBuf := make([]byte, footer.bloomFilterLength)
+		if _, err := file.ReadAt(bloomBuf, int64(footer.bloomFilterOffset)); err != nil {
+			return nil, err
+		}
+		bloom, err := DecodeBloomFilter(bloomBuf)
+		if err != nil {
+			return nil, err
+		}
+
+		x.attachEntries(decodedIndex.entries)
+		x.attachBloom(&bloom)
+		x.attachReader(file)
+		x.attachSize(int64(footer.sparseIndexOffset))
+
+		return &SSTable{path: path, file: file, index: index}, nil
+	}
+
 	data, err := io.ReadAll(file)
 	if err != nil {
 		return nil, err
-	}
-
-	if mode == sparseIndexMode {
-		expectedKeys := len(data) / minEncodedRecordLen
-		bloom := NewBloomFilter(expectedKeys, bloomFalsePositiveRate)
-		x, ok := index.(*sparseIndex)
-		if ok {
-			x.attachBloom(bloom)
-			x.attachReader(file)
-		}
 	}
 
 	offset := int64(0)
@@ -135,13 +195,6 @@ func OpenSSTable(path string, mode indexMode) (*SSTable, error) {
 		}
 		index.add(rec.Key, offset)
 		offset += int64(n)
-	}
-
-	if mode == sparseIndexMode {
-		x, ok := index.(*sparseIndex)
-		if ok {
-			x.attachSize(offset)
-		}
 	}
 
 	return &SSTable{path: path, file: file, index: index}, nil

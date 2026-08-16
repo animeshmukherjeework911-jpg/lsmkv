@@ -1,6 +1,7 @@
 package lsmkv
 
 import (
+	"bytes"
 	"fmt"
 	"math/rand"
 	"testing"
@@ -108,6 +109,125 @@ func TestBloomFilterSmallExpectedKeys(t *testing.T) {
 		t.Fatalf("MayContain returned error: %v", err)
 	}
 	_ = ok // not asserted: could legitimately be a false positive at this tiny scale
+}
+
+func TestBloomFilterEncodeDecodeRoundTrip(t *testing.T) {
+	bf := NewBloomFilter(1000, 0.01)
+
+	present := make([][]byte, 200)
+	for i := range present {
+		present[i] = []byte(fmt.Sprintf("present-%d", i))
+		if err := bf.Add(present[i]); err != nil {
+			t.Fatalf("Add(%q) returned error: %v", present[i], err)
+		}
+	}
+
+	encoded := EncodeBloomFilter(bf)
+
+	decoded, err := DecodeBloomFilter(encoded)
+	if err != nil {
+		t.Fatalf("DecodeBloomFilter returned error: %v", err)
+	}
+
+	if decoded.numBits != bf.numBits {
+		t.Errorf("numBits = %d, want %d", decoded.numBits, bf.numBits)
+	}
+	if decoded.numHashes != bf.numHashes {
+		t.Errorf("numHashes = %d, want %d", decoded.numHashes, bf.numHashes)
+	}
+	if !bytes.Equal(decoded.bitArray, bf.bitArray) {
+		t.Errorf("bitArray mismatch after round trip: got %x, want %x", decoded.bitArray, bf.bitArray)
+	}
+
+	// Every key added before encoding must still be reported present after decode.
+	for _, key := range present {
+		ok, err := decoded.MayContain(key)
+		if err != nil {
+			t.Fatalf("MayContain(%q) returned error: %v", key, err)
+		}
+		if !ok {
+			t.Errorf("decoded filter: MayContain(%q) = false, want true (false negative after round trip)", key)
+		}
+	}
+
+	// A handful of never-added keys should (almost always) still report absent,
+	// exercising the same bit array via the decoded filter, not just the original.
+	for i := 0; i < 20; i++ {
+		key := []byte(fmt.Sprintf("absent-%d", i))
+		originalOk, err := bf.MayContain(key)
+		if err != nil {
+			t.Fatalf("original MayContain(%q) returned error: %v", key, err)
+		}
+		decodedOk, err := decoded.MayContain(key)
+		if err != nil {
+			t.Fatalf("decoded MayContain(%q) returned error: %v", key, err)
+		}
+		if originalOk != decodedOk {
+			t.Errorf("MayContain(%q) disagreement: original=%v, decoded=%v", key, originalOk, decodedOk)
+		}
+	}
+}
+
+func TestBloomFilterEncodeDecodeEmpty(t *testing.T) {
+	// No keys ever Add-ed: round trip must still succeed and every lookup
+	// on the decoded filter must report absent.
+	bf := NewBloomFilter(100, 0.01)
+
+	encoded := EncodeBloomFilter(bf)
+	decoded, err := DecodeBloomFilter(encoded)
+	if err != nil {
+		t.Fatalf("DecodeBloomFilter returned error: %v", err)
+	}
+
+	ok, err := decoded.MayContain([]byte("anything"))
+	if err != nil {
+		t.Fatalf("MayContain returned error: %v", err)
+	}
+	if ok {
+		t.Errorf("MayContain on decoded empty filter = true, want false")
+	}
+}
+
+func TestBloomFilterDecodeShortBuffer(t *testing.T) {
+	cases := []struct {
+		name string
+		buf  []byte
+	}{
+		{"empty", nil},
+		{"crc only", make([]byte, 4)},
+		{"crc + numBits, missing numHashes", make([]byte, 12)},
+		{"one byte short of header", make([]byte, 19)},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := DecodeBloomFilter(c.buf)
+			if err == nil {
+				t.Errorf("DecodeBloomFilter(%d bytes) = nil error, want ErrShortBloomFilter", len(c.buf))
+			}
+		})
+	}
+}
+
+func TestBloomFilterDecodeCorruption(t *testing.T) {
+	bf := NewBloomFilter(100, 0.01)
+	if err := bf.Add([]byte("k")); err != nil {
+		t.Fatalf("Add returned error: %v", err)
+	}
+
+	encoded := EncodeBloomFilter(bf)
+
+	// Flip a bit well inside the bit array, past the header, so the payload
+	// changes but the buffer length stays valid — this must be caught by
+	// the crc check, not silently accepted.
+	corrupted := make([]byte, len(encoded))
+	copy(corrupted, encoded)
+	corrupted[len(corrupted)-1] ^= 0xFF
+
+	_, err := DecodeBloomFilter(corrupted)
+	if err == nil {
+		t.Fatal("DecodeBloomFilter on corrupted buffer = nil error, want a crc mismatch error")
+	}
 }
 
 func TestBloomFilterRandomKeys(t *testing.T) {

@@ -2,6 +2,8 @@ package lsmkv
 
 import (
 	"bytes"
+	"encoding/binary"
+	"errors"
 	"io"
 )
 
@@ -17,6 +19,72 @@ type sparseIndex struct {
 	bloom    *BloomFilter
 	reader   io.ReaderAt
 	size     int64
+}
+
+var ErrShortSparseIndex = errors.New("short or corrupt sparse index")
+var ErrCorruptedSparseIndex = errors.New("truncated sparse index, missing key length or missing offset")
+
+func (si *sparseIndex) EncodeSparseIndex() []byte {
+
+	totalSize := 4
+	for _, entry := range si.entries {
+		totalSize += 4 + len(entry.Key) + 8
+	}
+
+	buf := make([]byte, totalSize)
+	pos := 0
+
+	binary.LittleEndian.PutUint32(buf[pos:pos+4], uint32(len(si.entries)))
+	pos += 4
+
+	for _, entry := range si.entries {
+		binary.LittleEndian.PutUint32(buf[pos:pos+4], uint32(len(entry.Key)))
+		pos += 4
+
+		copy(buf[pos:pos+len(entry.Key)], entry.Key)
+		pos += len(entry.Key)
+
+		binary.LittleEndian.PutUint64(buf[pos:pos+8], uint64(entry.Offset))
+		pos += 8
+	}
+
+	return buf
+
+}
+
+func DecodeSparseIndex(buf []byte) (*sparseIndex, error) {
+	if len(buf) < 4 {
+		return nil, ErrShortSparseIndex
+	}
+
+	entryCount := binary.LittleEndian.Uint32(buf[0:4])
+	pos := 4
+
+	entries := make([]sparseIndexEntry, 0, entryCount)
+
+	for i := uint32(0); i < entryCount; i++ {
+		if len(buf)-pos < 4 {
+			return nil, ErrCorruptedSparseIndex
+		}
+		keyLen := binary.LittleEndian.Uint32(buf[pos : pos+4])
+		pos += 4
+
+		if len(buf)-pos < int(keyLen+8) {
+			return nil, ErrCorruptedSparseIndex
+		}
+
+		key := make([]byte, keyLen)
+		copy(key, buf[pos:pos+int(keyLen)])
+		pos += int(keyLen)
+
+		offset := int64(binary.LittleEndian.Uint64(buf[pos : pos+8]))
+		pos += 8
+
+		entries = append(entries, sparseIndexEntry{Key: key, Offset: offset})
+	}
+
+	return &sparseIndex{entries: entries}, nil
+
 }
 
 func newSparseIndex(interval int) *sparseIndex {
@@ -36,6 +104,10 @@ func (si *sparseIndex) attachReader(reader io.ReaderAt) {
 
 func (si *sparseIndex) attachSize(size int64) {
 	si.size = size
+}
+
+func (si *sparseIndex) attachEntries(entries []sparseIndexEntry) {
+	si.entries = entries
 }
 
 func (si *sparseIndex) add(key []byte, offset int64) {
