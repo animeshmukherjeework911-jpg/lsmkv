@@ -8,6 +8,18 @@ Rule of the road (same as the README): the gate is a passing test or a runnable
 demo, never "I read the chapter." Effort estimates assume ~1 focused hour a day
 while working full-time. They are guidance, not deadlines.
 
+**Remaining work, in hours (last updated after Stage 4 shipped and `SSTable.Records()`
+landed):**
+
+| Stage | Status | Remaining |
+|---|---|---|
+| 0–4 | ✅ done | 0 hrs |
+| 5 — Compaction (heap-based merge) | 🚧 in progress | ~8.5–10.5 hrs |
+| 5b — Crash-safe compaction | new, not started | ~6–7 hrs |
+| 6 — Benchmarks & analysis | not started | ~4–6 hrs |
+| Capstone | not started | ~1 weekend |
+| **Total to full completion** | | **~18.5–23.5 hrs** (+ capstone) |
+
 ---
 
 ## Stage 0 — Setup  ·  ~1 hour
@@ -92,7 +104,7 @@ lives in SSTable files on disk and comes back after a clean restart. This is the
 
 ---
 
-## Stage 4 — Fast reads at scale  ·  ~1–2 weeks  ·  (M4)
+## Stage 4 — Fast reads at scale  ·  ~1–2 weeks  ·  (M4)  ·  ✅ DONE
 **Finish:** Sparse per-block index + bloom filter; newest-wins reads across many
 SSTables. (You write the tests for this stage — a bloom-negative timing check.)
 **Artifact:** **A read-optimized store.** A `Get` for a missing key *skips* files via
@@ -100,20 +112,23 @@ the bloom filter instead of scanning them; a `Get` for a present key binary-sear
 to a block via the sparse index. Prove it with a timing test.
 **Portfolio value:** HIGH. "Implemented bloom filters and sparse indexing to cut
 read amplification" is a real systems sentence.
-- [ ] A test showing an absent-key `Get` touches far fewer files than a scan would.
-- [ ] Newest version of a key always wins across multiple SSTables.
+- [x] A test showing an absent-key `Get` touches far fewer files than a scan would
+      (`TestBloomFilterSkipsScanForAbsentKey`, a deterministic `ReadAt`-counter check
+      rather than wall-clock timing).
+- [x] Newest version of a key always wins across multiple SSTables
+      (`TestNewestWinsAcrossMultipleSSTables` — overwrite, fall-through, tombstone shadowing).
 
 **Implementation checklist:**
-- [ ] Bloom filter built during `FlushMemtable`, serialized into the SSTable file (`sstable.go`)
-- [ ] `SSTable` fields grow a loaded bloom filter (`sstable.go`)
-- [ ] `OpenSSTable` — reload sparse index and bloom filter into memory (`sstable.go`)
-- [ ] `SSTable.Get` — check the bloom filter first, early-return on a negative before touching the sparse index or data blocks (`sstable.go`)
-- [ ] `db.ssts` ordering decision (newest-first, per the `db.go` struct comment) actually enforced wherever tables are appended
-- [ ] Write the bloom-negative timing test yourself (no test file provided for this stage)
+- [x] Bloom filter built during `FlushMemtable`, serialized into the SSTable file (`bloom.go`, `sstable.go`)
+- [x] Sparse index grows a loaded bloom filter (`index_sparse.go`)
+- [x] `OpenSSTable` — reload sparse index and bloom filter directly from the footer, without decoding data blocks (`sstable.go`)
+- [x] `SSTable.Get` — check the bloom filter first, early-return on a negative before touching the sparse index or data blocks (`index_sparse.go`)
+- [x] `db.ssts` ordering (newest-last, per the `db.go` struct comment) verified by test
+- [x] Bloom-negative test, plus a data-block-corruption test proving `OpenSSTable` never decodes data blocks on open
 
 ---
 
-## Stage 5 — Self-maintaining store  ·  ~1–2 weeks  ·  (M5)
+## Stage 5 — Self-maintaining store  ·  (M5)  ·  🚧 IN PROGRESS
 **Finish:** `Compact` — a k-way merge of SSTables that keeps the newest version of
 each key and drops shadowed keys and dead tombstones. (You write the compaction test.)
 **Artifact:** **A complete LSM engine.** Write, overwrite, and delete the same key
@@ -125,16 +140,78 @@ you'll have written one.
 - [ ] Disk footprint measurably shrinks after compaction.
 
 **Implementation checklist:**
-- [ ] `Compact` — k-way merge of `inputs` (ordered newest-to-oldest), keep first-seen (i.e. newest) version of each key (`compaction.go`)
-- [ ] Drop a key entirely when its newest surviving version is a tombstone (real deletion, not just shadowing)
-- [ ] Write output via the same `FlushMemtable`-style path so compacted tables share the M3/M4 file format
-- [ ] Delete the old input files (via `SSTable.Path`) once the new merged table(s) are safely written
-- [ ] Wire a trigger for when `Compact` runs (e.g. `DB` calls it after N flushes) — pick a simple policy, don't over-design
-- [ ] Write the compaction test yourself (no test file provided for this stage)
+- [x] `SSTable.Records()` — decode the data-block region directly (bounded by the footer's
+      `sparseIndexOffset`) into every record in ascending key order, without touching the
+      sparse index/bloom/footer sections. Prerequisite for compaction, not originally a
+      named checklist item. — **~0.5–1 hr, done**
+- [ ] `Compact` — **heap-based** k-way merge of `inputs` (ordered newest-to-oldest): one
+      cursor per input's `Records()` slice, a min-heap keyed by `(Key, input recency)`,
+      pop the smallest key across all cursors each step, keep only the first (= newest)
+      version seen per key, advance that cursor. Chosen over a load-everything-into-a-map
+      merge specifically because it's the technique real LSM engines use — see the
+      real-world-fidelity discussion this stage prompted. (`compaction.go`) — **~2.5–3 hrs**
+- [ ] Drop a key entirely when its newest surviving version is a tombstone (real deletion,
+      not just shadowing) — folds into the heap loop above — **~0.5–1 hr**
+- [ ] Write output via the same `FlushMemtable`-style path: stage the merged records into a
+      fresh `*Memtable` and call `FlushMemtable` unchanged, so compacted tables share the
+      exact M3/M4 file format for free — **~1–1.5 hrs**
+- [ ] Delete the old input files (via `SSTable.Path`) once the new merged table is safely
+      written — the *basic* mechanism; making this crash-safe is Stage 5b below — **~0.5 hr**
+- [ ] Wire a trigger for when `Compact` runs (e.g. `DB` calls it after N flushes) — pick a
+      simple policy, don't over-design — **~1 hr**
+- [ ] Write the compaction test yourself (no test file provided for this stage) — **~1.5–2 hrs**
+- [ ] Edge-case buffer (all-same-key across every input, single-input compaction, an
+      input that's entirely tombstones) — **~1–1.5 hrs**
+
+**Stage 5 remaining: ~8.5–10.5 hrs** (down from the original ~8–12 hr estimate; `Records()`
+is already done).
 
 ---
 
-## Stage 6 — Measured & understood  ·  ~3–5 days  ·  (M6)
+## Stage 5b — Crash-safe compaction  ·  (M5b)  ·  NEW
+**Why this stage exists:** the engine is deliberately single-threaded (no goroutines, no
+locking anywhere) — a real, reasonable scope cut for a learning project. But single-threaded
+is not the same as crash-safe, and compaction is the one place a crash mid-operation can
+actually lose or duplicate data: it reads N files, writes a new one, and deletes the old
+ones — three separate durability events with no atomicity between them. Stage 1 already
+proved this project takes "survives `kill -9`" seriously for the WAL; compaction deserves
+the same treatment, or the crash-safety story for the whole engine is only half-told.
+**Finish:** A crash at any point during compaction — before the new file is durable, after
+it's durable but before old files are deleted, or mid-deletion — must never lose data and
+must never let stale, superseded data resurface.
+**Artifact:** **A compaction step that survives `kill -9` like the WAL does.** Same
+credibility move as Stage 1, applied to the part of the engine most people don't bother
+making crash-safe in a learning project.
+**Portfolio value:** HIGH — this is the detail that separates "I implemented compaction"
+from "I implemented compaction and thought about what happens when it's interrupted,"
+which is exactly the kind of thing a systems interview probes for.
+- [ ] A test: crash the process (simulated) between writing the new compacted file and
+      deleting the old input files — leave both on disk — and assert `Open` + `Get` still
+      return correct data, with no duplicate or incorrectly-shadowed results.
+- [ ] A test: crash with only a temp/incomplete compaction file present (never renamed into
+      place) — assert `Open` ignores or cleans it up, never treats it as a valid SSTable.
+
+**Implementation checklist:**
+- [ ] Write compacted output to a temp path, `Sync`, then atomically `os.Rename` into its
+      final filename — the rename is the commit point; nothing before it is visible as a
+      real SSTable — **~1 hr**
+- [ ] Only unlink old input files *after* the rename succeeds — never delete-then-write
+      — **~0.5 hr** (mostly a matter of correct ordering in `Compact`, small on its own)
+- [ ] Sequence-number assignment for the compacted output: it must sort as newer than every
+      input it replaces, but not newer than any table created after compaction started —
+      this is the subtle correctness piece, worth designing on paper before coding —
+      **~1–1.5 hrs**
+- [ ] `DB.Open` — detect and remove orphaned temp/incomplete compaction files left behind by
+      a crash before the rename ever happened — **~1 hr**
+- [ ] The two crash-simulation tests above — **~1.5–2 hrs**
+- [ ] Edge-case buffer (crash mid-rename, crash after deleting some but not all old inputs)
+      — **~1 hr**
+
+**Stage 5b total: ~6–7 hrs**
+
+---
+
+## Stage 6 — Measured & understood  ·  (M6)
 **Finish:** Un-skip and fill in `BenchmarkPut` / `BenchmarkGet`. Find the bottleneck.
 **Artifact:** **A benchmarked engine + a written analysis.** Real throughput and
 latency numbers, plus a paragraph naming which layer caps performance and *why*
@@ -145,10 +222,13 @@ it, and can explain its limits" is what a Staff interview is actually listening 
 - [ ] One paragraph: the bottleneck, the evidence, and what you'd change to move it.
 
 **Implementation checklist:**
-- [ ] Fill in `BenchmarkPut` — sequential keys first, then random; note the gap (`bench_test.go`)
-- [ ] Fill in `BenchmarkGet` — cold store vs warm, bloom filter should show up as savings (`bench_test.go`)
-- [ ] Profile (`pprof`) to find the actual bottleneck rather than guessing — likely candidates: `fsync` per `Append`, memtable sort at flush, bloom false-positive rate, compaction I/O
-- [ ] Write the named-bottleneck paragraph the stage gate asks for
+- [ ] Fill in `BenchmarkPut` — sequential keys first, then random; note the gap (`bench_test.go`) — **~1–1.5 hrs**
+- [ ] Fill in `BenchmarkGet` — cold store vs warm, bloom filter should show up as savings (`bench_test.go`) — **~1–1.5 hrs**
+- [ ] Profile (`pprof`) to find the actual bottleneck rather than guessing — likely candidates: `fsync` per `Append`, memtable sort at flush, bloom false-positive rate, compaction I/O — **~1.5–2 hrs**
+- [ ] Write the named-bottleneck paragraph the stage gate asks for — **~0.5–1 hr**
+
+**Stage 6 total: ~4–6 hrs.** Stronger done after Stage 5, since a realistic multi-SSTable
+"warm store" benchmark needs compaction to have happened at least once.
 
 ---
 
@@ -169,4 +249,7 @@ post (even 400 words) on what you learned building it.
 
 ### The shape, in one line
 Stages 1–3 make it **real** (stop here and you still have something honest).
-Stages 4–6 make it **good**. The capstone makes it **yours, and visible.**
+Stages 4–5 make it **good**. Stage 5b makes it **trustworthy under a crash, not just
+correct on the happy path** — the same promise Stage 1 made for the WAL, now made for
+compaction too. Stage 6 makes it **understood**. The capstone makes it **yours, and
+visible.**

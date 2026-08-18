@@ -170,3 +170,7 @@ func (si *sparseIndex) findStartOffset(key []byte) (int64, bool) {
 
 	return si.entries[lo-1].Offset, true
 }
+
+func (si *sparseIndex) dataSize() int64 {
+	return si.size
+}

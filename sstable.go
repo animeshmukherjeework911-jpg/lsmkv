@@ -15,12 +15,12 @@ const (
 //
 // File layout:
 //
-//	[ sorted data blocks ] [ sparse index ] [ bloom filter ] [ footer ]
+//		[ sorted data blocks ] [ sparse index ] [ bloom filter ] [ footer ]
 //
-//   - sparse index: one key per block, so Get binary-searches to a block instead
-//     of scanning the whole file.
-//   - bloom filter: lets Get skip this file entirely when the key is absent.
-//     A read-heavy store lives or dies on this early-out.
+//	  - sparse index: one key per block, so Get binary-searches to a block instead
+//	    of scanning the whole file.
+//	  - bloom filter: lets Get skip this file entirely when the key is absent.
+//	    A read-heavy store lives or dies on this early-out.
 type SSTable struct {
 	path  string
 	file  *os.File
@@ -162,6 +162,32 @@ func (s *SSTable) Get(key []byte) (Record, bool, error) {
 		return Record{}, false, err
 	}
 	return record, true, nil
+}
+
+// Records returns every record in this table, in ascending key order, by
+// decoding the data-block region directly — the sparse index, bloom filter,
+// and footer sections are never touched. Used by compaction, which needs to
+// see every record, not just look up one key at a time.
+func (s *SSTable) Records() ([]Record, error) {
+	size := s.index.dataSize()
+
+	buf := make([]byte, size)
+	if _, err := s.file.ReadAt(buf, 0); err != nil {
+		return nil, err
+	}
+
+	records := make([]Record, 0)
+	offset := int64(0)
+	for offset < size {
+		rec, n, err := Decode(buf[offset:])
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, rec)
+		offset += int64(n)
+	}
+
+	return records, nil
 }
 
 // Path returns the file this table is backed by (used by compaction to delete it).
