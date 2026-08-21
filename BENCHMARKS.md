@@ -65,6 +65,94 @@ which is precisely why the read-amplification bug above was invisible until this
 benchmark existed — bloom rejects always looked fast in isolation; only comparing
 them to a real hit exposed how much extra a hit was paying for.
 
+## Compared to a real-world LSM: goleveldb
+
+bbolt (below) is a B+tree, so it's a useful contrast but not a fair
+apples-to-apples comparison — its whole *shape* trades differently against
+disk. [goleveldb](https://github.com/syndtr/goleveldb) is a complete,
+production-used reimplementation of LevelDB in pure Go: same log-structured
+shape as `lsmkv` (WAL, memtable, immutable SSTables, background compaction),
+same language, same machine, same `-benchtime=200ms`, `WriteOptions{Sync:
+true}` to match `lsmkv`'s one-fsync-per-write contract:
+
+```
+                          lsmkv                    goleveldb
+Put/Sequential      2.36 ms/op,   418 B/op    8.39 ms/op,  379 B/op,  6 allocs/op
+Put/Random          2.44 ms/op,   423 B/op    7.33 ms/op,  255 B/op,  3 allocs/op
+Get/Hit             58.1 μs/op*, 337 KB/op*   898  ns/op,  744 B/op, 13 allocs/op
+Get/AbsentKey       1.65 μs/op,  1040 B/op    188  ns/op,  136 B/op,  4 allocs/op
+```
+\* `lsmkv`'s worst-case hit (key only in the oldest of 5 tables), inflated by
+the read-amplification bug documented above.
+
+**`lsmkv`'s writes are faster than a real LSM's here** — surprising until you
+remember what `goleveldb` is doing that this project isn't: a write-ahead log
+entry AND manifest/version-set bookkeeping AND (once a memtable fills)
+background compaction coordination, all behind that one `Sync: true` call.
+`lsmkv`'s WAL append is closer to the theoretical floor for "durably persist
+one record" — goleveldb pays extra for durability *guarantees this project
+doesn't make* (atomic multi-file manifest updates, snapshot isolation, crash
+recovery across a much larger state machine). This is a real, honest
+trade-off, not a bug on either side: `lsmkv` is faster here because it does
+less.
+
+**`goleveldb`'s reads are ~9x-to-65x faster, and that gap is the real
+finding.** Some of it is the same bug already documented (`SSTableHit`'s
+337KB read amplification) — but even comparing `AbsentKey` to `AbsentKey`
+(no bug in that path, pure bloom-filter-reject cost on both sides),
+goleveldb is still ~9x faster (188ns vs 1.65μs). `SSTable.Get` in this repo
+calls `file.Stat()` on *every* lookup before even consulting the bloom
+filter (`sstable.go`) — a syscall paid on every miss, when the file size
+practically never changes between reads and could just be cached at
+`OpenSSTable` time instead. A production engine like goleveldb caches
+aggressively (block cache, open file handles, precomputed metadata) for
+exactly this reason: syscalls are expensive relative to an in-memory bloom
+check, and a real engine amortizes that cost once per file open, not once
+per `Get`.
+
+## Compared to a real embedded store: bbolt
+
+Numbers from someone else's blog post are a different machine, different disk,
+different fsync settings — not a fair comparison. So instead: [bbolt](https://github.com/etcd-io/bbolt)
+(etcd's B+tree store, pure Go, no cgo) benchmarked the same way, on the same
+machine, same value size, same one-fsync-per-write durability contract, same
+`-benchtime=200ms` run:
+
+```
+                          lsmkv (LSM)              bbolt (B+tree)
+Put/Sequential      2.43 ms/op,  431 B/op    3.34 ms/op, 12645 B/op, 51 allocs/op
+Put/Random          3.23 ms/op,  406 B/op    2.50 ms/op, 12403 B/op, 51 allocs/op
+Get (warm, on disk)  133 μs/op*, 337 KB/op*    734 ns/op,   576 B/op,  9 allocs/op
+```
+\* `lsmkv`'s `SSTableHit` number — deliberately the worst case (key only in the
+oldest of 5 SSTables) and inflated by the read-amplification bug documented
+above; a bloom-filter miss (`AbsentKey`) on the same store is ~2.9μs.
+
+**Writes land in the same place, for the reason you'd expect.** Both stores pay
+one `fsync` per write, and fsync latency is a disk-hardware fact neither
+storage structure can out-design — this benchmark's ~2.5–3.3ms is this
+particular disk's fsync cost, full stop. Any B+tree vs. LSM write-throughput
+argument really shows up under *batched* commits or concurrent writers, which
+neither benchmark here does (both are one write, one fsync, no batching).
+
+**Reads are where the architectures actually diverge, and bbolt wins here by
+a lot.** A B+tree lookup is O(log n) page reads against a single file that's
+mostly resident in the OS page cache after the initial load — 734ns is
+basically "walk a few in-memory pages." lsmkv's LSM design pays an inherent
+LSM tax on reads: `Get` may have to consult *multiple* SSTables (newest to
+oldest) before finding — or ruling out — a key, and this store's `Get` adds a
+self-inflicted over-read on top of that inherent cost (see above). Even
+without that bug, an LSM's read path is structurally more expensive than a
+B+tree's for a store this size; the trade lsmkv is making is *write* latency
+and throughput (sequential appends to an immutable file, no in-place page
+splits) in exchange for read complexity — the same trade every real LSM engine
+(LevelDB, RocksDB) makes, and why they all lean so heavily on bloom filters
+and multi-level compaction to buy back the read cost. At small scale, a
+B+tree like bbolt is a perfectly reasonable, often better, choice; the LSM
+shape earns its keep at write-heavy scale and against slower/spinning disks,
+where turning random writes into sequential ones matters more than it does on
+this machine's disk.
+
 ## Compaction
 
 Not separately benchmarked here — `Compact`'s cost is dominated by the same forces
