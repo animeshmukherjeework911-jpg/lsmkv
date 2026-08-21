@@ -14,6 +14,12 @@ const (
 	sstableSuffix                 = ".sst"
 	sstableSeqWidth               = 8
 	defaultMemtableFlushThreshold = 4 << 20
+
+	// sstableCompactionThreshold is the simplest possible trigger: once this
+	// many SSTables have piled up, merge all of them into one. Real engines
+	// tier this (size-tiered / leveled); a single flat threshold is enough
+	// for M5.
+	sstableCompactionThreshold = 4
 )
 
 // DB is the public storage engine. Keep the two paths below taped to your monitor;
@@ -87,6 +93,29 @@ func latestSSTable(dir string) (string, int, bool, error) {
 
 }
 
+// removeOrphanedCompactionTemps deletes any *.sst.tmp file left behind by a
+// crash during Compact between FlushMemtable durably writing the temp file
+// and the rename that would have turned it into a real SSTable. Such a file
+// was never committed, so it's never valid input for loadSSTables.
+func removeOrphanedCompactionTemps(dir string) error {
+	pattern := filepath.Join(dir, sstablePrefix+"*"+sstableSuffix+compactionTempSuffix)
+	temps, err := filepath.Glob(pattern)
+	if err != nil {
+		return err
+	}
+	for _, t := range temps {
+		if err := os.Remove(t); err != nil {
+			return err
+		}
+	}
+	if len(temps) > 0 {
+		if err := syncDir(dir); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func loadSSTables(dir string) ([]*SSTable, error) {
 	files, err := filepath.Glob(filepath.Join(dir, sstablePrefix+"*"+sstableSuffix))
 	if err != nil {
@@ -130,6 +159,10 @@ func Open(dir string) (*DB, error) {
 		return nil, err
 	}
 
+	if err := removeOrphanedCompactionTemps(dir); err != nil {
+		return nil, err
+	}
+
 	ssts, err := loadSSTables(dir)
 	if err != nil {
 		return nil, err
@@ -149,6 +182,29 @@ func Open(dir string) (*DB, error) {
 	}
 	return &DB{dir: dir, wal: wal, mem: mem, ssts: ssts}, nil
 	// return nil, ErrNotImplemented // TODO(M1 gives it WAL replay; it grows through M4)
+}
+
+// maybeCompact merges every current SSTable into one once their count reaches
+// sstableCompactionThreshold. db.ssts is kept oldest-to-newest (see the Get
+// read path below), but Compact wants inputs newest-to-oldest, so the slice
+// is reversed on the way in.
+func (db *DB) maybeCompact() error {
+	if len(db.ssts) < sstableCompactionThreshold {
+		return nil
+	}
+
+	inputs := make([]*SSTable, len(db.ssts))
+	for i, sst := range db.ssts {
+		inputs[len(db.ssts)-1-i] = sst
+	}
+
+	outputs, err := Compact(inputs, db.dir)
+	if err != nil {
+		return err
+	}
+
+	db.ssts = outputs
+	return nil
 }
 
 // Put stores key=value durably. See the write path above.
@@ -179,6 +235,10 @@ func (db *DB) Put(key, value []byte) error {
 		}
 
 		db.mem = NewMemtable()
+
+		if err := db.maybeCompact(); err != nil {
+			return err
+		}
 	}
 	return nil
 
@@ -245,6 +305,10 @@ func (db *DB) Close() error {
 			return err
 		}
 		db.mem = NewMemtable()
+
+		if err := db.maybeCompact(); err != nil {
+			return err
+		}
 	}
 
 	return db.wal.Close()
